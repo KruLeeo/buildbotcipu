@@ -1,7 +1,7 @@
 from aiogram import Bot, types
 
 from config import ADMIN_ID, ALLOWED_USERNAMES
-from db_manager import db
+from db_manager import STATUS_LABELS, db
 import kb
 
 log = __import__("logging").getLogger("build_bot")
@@ -31,9 +31,25 @@ def format_product_caption(p: dict) -> str:
     return "\n".join(lines)
 
 
-async def send_product_card(bot: Bot, chat_id: int, p: dict, is_admin_user: bool):
+async def send_product_card(
+    bot: Bot,
+    chat_id: int,
+    p: dict,
+    is_admin_user: bool,
+    user_id: int | None = None,
+    in_favorites: bool | None = None,
+):
     caption = format_product_caption(p)
-    markup = kb.product_kb(p["id"], is_admin=is_admin_user, in_stock=(p.get("stock") or 0) > 0)
+    if in_favorites is None and user_id is not None:
+        in_favorites = db.is_favorite(user_id, p["id"])
+    elif in_favorites is None:
+        in_favorites = False
+    markup = kb.product_kb(
+        p["id"],
+        is_admin=is_admin_user,
+        in_stock=(p.get("stock") or 0) > 0,
+        in_favorites=in_favorites,
+    )
     file_id = p.get("image_file_id")
     if file_id:
         await bot.send_photo(chat_id, file_id, caption=caption, reply_markup=markup, parse_mode="Markdown")
@@ -44,6 +60,39 @@ async def send_product_card(bot: Bot, chat_id: int, p: dict, is_admin_user: bool
 async def menu_for(user_id: int, role: str | None = None):
     role = role or db.get_role(user_id)
     return kb.get_main_menu(role, db.get_cart_count(user_id))
+
+
+def format_order_detail(order: dict) -> str:
+    profile = db.get_profile(order["user_id"])
+    status = STATUS_LABELS.get(order.get("status"), order.get("status", "—"))
+    delivery = "Самовывоз" if order.get("delivery_type") == "pickup" else "Доставка"
+    if not order.get("delivery_type"):
+        delivery = "—"
+
+    lines = [
+        f"🆔 Заказ №{order['id']}",
+        f"📋 Статус: {status}",
+        f"👤 Клиент ID: {order['user_id']}",
+    ]
+    if profile:
+        lines.append(f"   ФИО: {profile[0]}")
+        lines.append(f"   Тел: {profile[1]}")
+        lines.append(f"   Город: {profile[2]}")
+    lines.extend([
+        "",
+        f"🛒 Состав:\n{order.get('items_text') or '—'}",
+        "",
+        f"💰 Сумма: {int(order['total']):,} ₽",
+    ])
+    discount = order.get("discount") or 0
+    if discount > 0:
+        lines.append(f"🏷 Скидка: −{int(discount):,} ₽")
+    lines.extend([
+        f"📞 Телефон заказа: {order.get('phone') or '—'}",
+        f"📍 Адрес: {order.get('address') or '—'}",
+        f"🚚 Способ: {delivery}",
+    ])
+    return "\n".join(lines)
 
 
 def format_dashboard_text() -> str:

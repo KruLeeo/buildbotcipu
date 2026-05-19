@@ -43,6 +43,10 @@ class SearchStates(StatesGroup):
     query = State()
 
 
+class CartQtyStates(StatesGroup):
+    qty = State()
+
+
 class FaqEditStates(StatesGroup):
     title = State()
     content = State()

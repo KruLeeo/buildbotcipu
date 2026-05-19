@@ -31,18 +31,17 @@ async def admin_users_list(callback: CallbackQuery):
     users, has_next = db.get_users_paginated(page)
     if not users and page > 0:
         return await callback.answer("Больше нет записей", show_alert=True)
-    lines = [f"👥 **Пользователи** (стр. {page + 1})\n"]
+    lines = [f"👥 Пользователи (стр. {page + 1})\n"]
     for u in users:
         uname = f"@{u['username']}" if u.get("username") else "—"
         fname = u.get("full_name") or u.get("first_name") or "—"
         seen = (u.get("last_seen") or "")[:16]
         lines.append(
-            f"• `{u['user_id']}` {uname}\n  {fname} | заказов: {u['orders_count']} | {seen}"
+            f"• ID {u['user_id']} {uname}\n  {fname} | заказов: {u['orders_count']} | {seen}"
         )
     await callback.message.answer(
         "\n".join(lines),
         reply_markup=kb.admin_users_kb(page, has_next),
-        parse_mode="Markdown",
     )
     await callback.answer()
     log.info("Admin %s viewed users page %s", callback.from_user.id, page)

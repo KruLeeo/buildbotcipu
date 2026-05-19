@@ -285,6 +285,32 @@ class Database:
         self.conn.commit()
         return True, None
 
+    def set_cart_qty(self, user_id, product_id, qty):
+        product = self.get_product_by_id(product_id)
+        if not product:
+            return False, "Товар не найден"
+        if qty <= 0:
+            self.remove_from_cart(user_id, product_id)
+            return True, None
+        if qty > product["stock"]:
+            return False, f"Доступно только {product['stock']} шт."
+        self.cursor.execute(
+            "SELECT 1 FROM cart_items WHERE user_id = ? AND product_id = ?",
+            (user_id, product_id),
+        )
+        if self.cursor.fetchone():
+            self.cursor.execute(
+                "UPDATE cart_items SET qty = ? WHERE user_id = ? AND product_id = ?",
+                (qty, user_id, product_id),
+            )
+        else:
+            self.cursor.execute(
+                "INSERT INTO cart_items (user_id, product_id, qty) VALUES (?, ?, ?)",
+                (user_id, product_id, qty),
+            )
+        self.conn.commit()
+        return True, None
+
     def change_cart_qty(self, user_id, product_id, delta):
         self.cursor.execute(
             "SELECT qty FROM cart_items WHERE user_id = ? AND product_id = ?",
@@ -368,6 +394,13 @@ class Database:
         )
         self.conn.commit()
         return True
+
+    def is_favorite(self, user_id, product_id):
+        self.cursor.execute(
+            "SELECT 1 FROM favorites WHERE user_id = ? AND product_id = ?",
+            (user_id, product_id),
+        )
+        return self.cursor.fetchone() is not None
 
     def get_favorites(self, user_id):
         self.cursor.execute(

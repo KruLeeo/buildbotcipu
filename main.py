@@ -17,6 +17,7 @@ from handlers import admin_catalog_router, admin_faq_router, admin_users_router
 from helpers import (
     WELCOME_TEXT,
     format_dashboard_text,
+    format_order_detail,
     is_admin,
     menu_for,
     send_product_card,
@@ -25,7 +26,18 @@ from middleware.stats import StatsMiddleware
 from utils.logger import setup_logging
 from utils.validators import normalize_phone, validate_city, validate_fio
 import kb
-from states import CheckoutStates, ProfileStates, SearchStates
+from states import CartQtyStates, CheckoutStates, ProfileStates, SearchStates
+
+CART_PLUS_CLICK_LIMIT = 3
+_cart_plus_clicks: dict[tuple[int, int], int] = {}
+
+
+def _reset_plus_clicks(user_id: int, product_id: int | None = None):
+    if product_id is not None:
+        _cart_plus_clicks.pop((user_id, product_id), None)
+    else:
+        for key in [k for k in _cart_plus_clicks if k[0] == user_id]:
+            _cart_plus_clicks.pop(key, None)
 
 logger = setup_logging()
 bot = Bot(token=BOT_TOKEN)
@@ -80,7 +92,10 @@ async def show_items(callback: types.CallbackQuery):
     if not items:
         return await callback.answer("В категории нет товаров", show_alert=True)
     for item in items:
-        await send_product_card(bot, callback.message.chat.id, item, is_admin(callback.from_user))
+        await send_product_card(
+            bot, callback.message.chat.id, item, is_admin(callback.from_user),
+            user_id=callback.from_user.id,
+        )
     await callback.answer()
 
 
@@ -92,7 +107,10 @@ async def emergency(message: types.Message):
         return await message.answer("Список аварийных позиций пуст.")
     await message.answer("🚨 **Срочные позиции:**", parse_mode="Markdown")
     for item in items:
-        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
+        await send_product_card(
+            bot, message.chat.id, item, is_admin(message.from_user),
+            user_id=message.from_user.id,
+        )
 
 
 # --- ПОИСК ---
@@ -110,7 +128,10 @@ async def search_run(message: types.Message, state: FSMContext):
         return await message.answer("Ничего не найдено.")
     await message.answer(f"Найдено: {len(items)}")
     for item in items:
-        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
+        await send_product_card(
+            bot, message.chat.id, item, is_admin(message.from_user),
+            user_id=message.from_user.id,
+        )
 
 
 # --- ИЗБРАННОЕ ---
@@ -120,14 +141,34 @@ async def favorites(message: types.Message):
     if not items:
         return await message.answer("Избранное пусто.")
     for item in items:
-        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
+        await send_product_card(
+            bot, message.chat.id, item, is_admin(message.from_user),
+            user_id=message.from_user.id,
+            in_favorites=True,
+        )
 
 
 @dp.callback_query(F.data.startswith("fav_"))
 async def toggle_fav(callback: types.CallbackQuery):
     pid = int(callback.data.split("_")[1])
-    added = db.toggle_favorite(callback.from_user.id, pid)
-    await callback.answer("В избранном" if added else "Убрано из избранного")
+    uid = callback.from_user.id
+    added = db.toggle_favorite(uid, pid)
+    await callback.answer("Добавлено в избранное" if added else "Убрано из избранного")
+
+    p = db.get_product_by_id(pid)
+    if not p:
+        return
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=kb.product_kb(
+                pid,
+                is_admin=is_admin(callback.from_user),
+                in_stock=(p.get("stock") or 0) > 0,
+                in_favorites=db.is_favorite(uid, pid),
+            )
+        )
+    except Exception:
+        pass
 
 
 # --- КОРЗИНА ---
@@ -145,57 +186,142 @@ async def buy(callback: types.CallbackQuery):
 
 
 @dp.message(F.text.startswith("🛒 Корзина"))
-async def show_cart(message: types.Message):
-    text, *_ = db.format_cart_text(message.from_user.id)
+async def show_cart(message: types.Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    _reset_plus_clicks(uid)
+    text, *_ = db.format_cart_text(uid)
     if not text:
         return await message.answer("Корзина пуста.")
-    await message.answer(text, reply_markup=kb.cart_kb(), parse_mode="Markdown")
-    for item in db.get_cart_items(message.from_user.id):
-        await message.answer(
-            f"{item['name']} × {item['qty']}",
-            reply_markup=kb.cart_item_kb(item["product_id"]),
-        )
+    await message.answer(
+        text,
+        reply_markup=kb.cart_items_kb(uid),
+        parse_mode="Markdown",
+    )
+
+
+@dp.callback_query(F.data == "cart_noop")
+async def cart_noop(callback: types.CallbackQuery):
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("cart_plus_"))
-async def cart_plus(callback: types.CallbackQuery):
+async def cart_plus(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
     pid = int(callback.data.split("_")[2])
-    if not db.change_cart_qty(callback.from_user.id, pid, 1):
+    key = (uid, pid)
+    clicks = _cart_plus_clicks.get(key, 0) + 1
+
+    if clicks > CART_PLUS_CLICK_LIMIT:
+        _cart_plus_clicks[key] = 0
+        product = db.get_product_by_id(pid)
+        stock = product["stock"] if product else 0
+        await state.update_data(cart_pid=pid, cart_message_id=callback.message.message_id)
+        await state.set_state(CartQtyStates.qty)
+        await callback.answer()
+        await callback.message.answer(
+            f"Введите нужное количество (от 1 до {stock}):"
+        )
+        return
+
+    if not db.change_cart_qty(uid, pid, 1):
         return await callback.answer("Недостаточно на складе", show_alert=True)
-    await callback.answer("+1")
-    await _refresh_cart(callback)
+
+    _cart_plus_clicks[key] = clicks
+    await callback.answer()
+    await _refresh_cart_view(callback)
+
+
+@dp.message(CartQtyStates.qty)
+async def cart_qty_entered(message: types.Message, state: FSMContext):
+    if not message.text.strip().isdigit():
+        return await message.answer("Введите целое число, например: 10")
+    qty = int(message.text.strip())
+    data = await state.get_data()
+    pid = data["cart_pid"]
+    uid = message.from_user.id
+
+    ok, err = db.set_cart_qty(uid, pid, qty)
+    if not ok:
+        return await message.answer(err)
+
+    _reset_plus_clicks(uid, pid)
+    await state.clear()
+
+    text, *_ = db.format_cart_text(uid)
+    msg_id = data.get("cart_message_id")
+    if text and msg_id:
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=message.chat.id,
+                message_id=msg_id,
+                reply_markup=kb.cart_items_kb(uid),
+                parse_mode="Markdown",
+            )
+            await message.answer(f"✅ Установлено: {qty} шт.")
+            return
+        except Exception:
+            pass
+    if text:
+        await message.answer(
+            text,
+            reply_markup=kb.cart_items_kb(uid),
+            parse_mode="Markdown",
+        )
+    else:
+        await message.answer("Корзина пуста.", reply_markup=await menu_for(uid))
 
 
 @dp.callback_query(F.data.startswith("cart_minus_"))
 async def cart_minus(callback: types.CallbackQuery):
     pid = int(callback.data.split("_")[2])
     db.change_cart_qty(callback.from_user.id, pid, -1)
-    await callback.answer("-1")
-    await _refresh_cart(callback)
+    await callback.answer()
+    await _refresh_cart_view(callback)
 
 
 @dp.callback_query(F.data.startswith("cart_remove_"))
 async def cart_remove(callback: types.CallbackQuery):
+    uid = callback.from_user.id
     pid = int(callback.data.split("_")[2])
-    db.remove_from_cart(callback.from_user.id, pid)
+    db.remove_from_cart(uid, pid)
+    _reset_plus_clicks(uid, pid)
     await callback.answer("Удалено")
-    await _refresh_cart(callback)
+    await _refresh_cart_view(callback)
 
 
-async def _refresh_cart(callback: types.CallbackQuery):
-    text, *_ = db.format_cart_text(callback.from_user.id)
-    if text:
-        try:
-            await callback.message.edit_text(text, parse_mode="Markdown")
-        except Exception:
-            pass
+async def _refresh_cart_view(callback: types.CallbackQuery):
+    uid = callback.from_user.id
+    text, *_ = db.format_cart_text(uid)
+    if not text:
+        await callback.message.edit_text("🗑 Корзина пуста.")
+        await callback.message.answer(
+            "Выберите товары в каталоге.",
+            reply_markup=await menu_for(uid),
+        )
+        return
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb.cart_items_kb(uid),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=kb.cart_items_kb(uid),
+            parse_mode="Markdown",
+        )
 
 
 @dp.callback_query(F.data == "clear_cart")
 async def clear_cart_handler(callback: types.CallbackQuery):
-    if not db.get_cart_count(callback.from_user.id):
+    uid = callback.from_user.id
+    if not db.get_cart_count(uid):
         return await callback.answer("Корзина пуста", show_alert=True)
-    db.clear_cart(callback.from_user.id)
+    db.clear_cart(uid)
+    _reset_plus_clicks(uid)
     await callback.message.edit_text("🗑 Корзина очищена.")
     await callback.message.answer(reply_markup=await menu_for(callback.from_user.id))
     await callback.answer()
@@ -483,13 +609,13 @@ async def status_upd(callback: types.CallbackQuery):
 async def admin_history_done(callback: types.CallbackQuery):
     if not is_admin(callback.from_user):
         return
-    orders = db.get_orders_by_status(STATUS_COMPLETED)[:15]
+    orders = db.get_orders_by_status(STATUS_COMPLETED)[:20]
     if not orders:
         return await callback.answer("Пусто", show_alert=True)
-    text = "✅ **Завершённые:**\n\n" + "\n".join(
-        f"#{o['id']} | {int(o['total']):,} ₽" for o in orders
+    await callback.message.answer(
+        "✅ Завершённые заказы — нажмите, чтобы открыть состав:",
+        reply_markup=kb.admin_orders_archive_kb(orders),
     )
-    await callback.message.answer(text, parse_mode="Markdown")
     await callback.answer()
 
 
@@ -497,11 +623,37 @@ async def admin_history_done(callback: types.CallbackQuery):
 async def admin_history_cancel(callback: types.CallbackQuery):
     if not is_admin(callback.from_user):
         return
-    orders = db.get_orders_by_status(STATUS_CANCELLED)[:15]
+    orders = db.get_orders_by_status(STATUS_CANCELLED)[:20]
     if not orders:
         return await callback.answer("Пусто", show_alert=True)
-    text = "❌ **Отменённые:**\n\n" + "\n".join(f"#{o['id']}" for o in orders)
-    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.message.answer(
+        "❌ Отменённые заказы — нажмите, чтобы открыть состав:",
+        reply_markup=kb.admin_orders_archive_kb(orders),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admord_"))
+async def admin_order_detail(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user):
+        return await callback.answer("Нет доступа", show_alert=True)
+    oid = int(callback.data.split("_")[1])
+    order = db.get_order_by_id(oid)
+    if not order:
+        return await callback.answer("Заказ не найден", show_alert=True)
+
+    status = order.get("status")
+    if status == STATUS_COMPLETED:
+        back = "admin_history_done"
+    elif status == STATUS_CANCELLED:
+        back = "admin_history_cancel"
+    else:
+        back = "admin_dashboard"
+
+    await callback.message.answer(
+        format_order_detail(order),
+        reply_markup=kb.admin_order_detail_kb(oid, back),
+    )
     await callback.answer()
 
 
