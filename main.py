@@ -1,319 +1,554 @@
 import asyncio
-import logging
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from config import BOT_TOKEN, ADMIN_ID, ALLOWED_USERNAMES
-from db_manager import db
+from aiogram.fsm.storage.memory import MemoryStorage
+
+from config import ADMIN_ID, BOT_TOKEN
+from db_manager import (
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_LABELS,
+    STATUS_PROCESSING,
+    db,
+)
+from handlers import admin_catalog_router, admin_faq_router, admin_users_router
+from helpers import (
+    WELCOME_TEXT,
+    format_dashboard_text,
+    is_admin,
+    menu_for,
+    send_product_card,
+)
+from middleware.stats import StatsMiddleware
+from utils.logger import setup_logging
+from utils.validators import normalize_phone, validate_city, validate_fio
 import kb
+from states import CheckoutStates, ProfileStates, SearchStates
 
-logging.basicConfig(level=logging.INFO)
+logger = setup_logging()
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-user_carts = {}
+dp = Dispatcher(storage=MemoryStorage())
+dp.update.middleware(StatsMiddleware())
+dp.include_router(admin_catalog_router)
+dp.include_router(admin_faq_router)
+dp.include_router(admin_users_router)
 
-# Состояния
-class ProfileStates(StatesGroup):
-    name, phone, city = State(), State(), State()
 
-class AddProductStates(StatesGroup):
-    name, price, category, specs = State(), State(), State(), State()
+# --- START / В НАЧАЛО ---
+async def _send_home(chat_id: int, user: types.User, state: FSMContext):
+    await state.clear()
+    uid = user.id
+    role = "admin" if is_admin(user) else db.get_role(uid)
+    db.touch_user(uid, user.username, user.first_name)
+    if role == "admin":
+        db.set_role(uid, "admin")
+    await bot.send_message(
+        chat_id,
+        WELCOME_TEXT,
+        reply_markup=await menu_for(uid, role),
+        parse_mode="Markdown",
+    )
 
-class EditProductStates(StatesGroup):
-    pid = State()
-    name = State()
-    price = State()
-    specs = State()
-
-def is_admin(user: types.User):
-    return user.id == ADMIN_ID or user.username in ALLOWED_USERNAMES
 
 @dp.message(Command("start"))
-async def start(message: types.Message):
-    role = 'admin' if is_admin(message.from_user) else db.get_role(message.from_user.id)
-    if role == 'admin': db.set_role(message.from_user.id, 'admin')
-    count = len(user_carts.get(message.from_user.id, []))
-    await message.answer("🛠 **Строительный Магазин**\nДобро пожаловать!", reply_markup=kb.get_main_menu(role, count))
+@dp.message(F.text == kb.HOME_TEXT)
+async def start(message: types.Message, state: FSMContext):
+    logger.info("User %s home", message.from_user.id)
+    await _send_home(message.chat.id, message.from_user, state)
+
+
+@dp.callback_query(F.data == kb.HOME_CALLBACK)
+async def go_home_callback(callback: types.CallbackQuery, state: FSMContext):
+    await _send_home(callback.message.chat.id, callback.from_user, state)
+    await callback.answer()
+
 
 # --- КАТАЛОГ ---
 @dp.message(F.text == "🏬 Каталог")
 async def show_catalog(message: types.Message):
+    if not db.get_categories():
+        return await message.answer("Каталог пуст.")
     await message.answer("Выберите раздел:", reply_markup=kb.get_catalog_kb())
+
 
 @dp.callback_query(F.data.startswith("cat_"))
 async def show_items(callback: types.CallbackQuery):
-    category = callback.data.split("_")[1]
+    category = callback.data.removeprefix("cat_")
     items = db.get_products(category)
-    admin_status = is_admin(callback.from_user) # Проверяем, админ ли это
-    
+    if not items:
+        return await callback.answer("В категории нет товаров", show_alert=True)
     for item in items:
-        await callback.message.answer(
-            f"📦 **{item[1]}**\n📝 {item[4]}\n💰 {int(item[2]):,} руб.",
-            # В функцию buy_kb нужно будет добавить передачу аргумента is_admin
-            reply_markup=kb.buy_kb(item[0], is_admin=admin_status), 
-            parse_mode="Markdown"
-        )
+        await send_product_card(bot, callback.message.chat.id, item, is_admin(callback.from_user))
     await callback.answer()
 
-# --- РЕДАКТИРОВАНИЕ ТОВАРА (АДМИН) ---
 
-@dp.callback_query(F.data.startswith("edit_prod_"))
-async def edit_p_start(callback: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user): return
-    
-    pid = int(callback.data.split("_")[2])
-    await state.update_data(edit_pid=pid)
-    
-    await callback.message.answer("Введите НОВОЕ название товара (или '-' чтобы оставить прежним):")
-    await state.set_state(EditProductStates.name)
-    await callback.answer()
+# --- АВАРИЯ ---
+@dp.message(F.text == "🚨 Авария 24/7")
+async def emergency(message: types.Message):
+    items = db.get_emergency_products()
+    if not items:
+        return await message.answer("Список аварийных позиций пуст.")
+    await message.answer("🚨 **Срочные позиции:**", parse_mode="Markdown")
+    for item in items:
+        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
 
-@dp.message(EditProductStates.name)
-async def edit_p_name(m: types.Message, state: FSMContext):
-    await state.update_data(name=m.text)
-    await m.answer("Введите НОВУЮ цену (или '-' чтобы оставить):")
-    await state.set_state(EditProductStates.price)
 
-@dp.message(EditProductStates.price)
-async def edit_p_price(m: types.Message, state: FSMContext):
-    if m.text != "-" and not m.text.isdigit():
-        return await m.answer("Введите число или '-'!")
-    
-    await state.update_data(price=m.text)
-    await m.answer("Введите НОВОЕ описание (или '-' чтобы оставить):")
-    await state.set_state(EditProductStates.specs)
+# --- ПОИСК ---
+@dp.message(F.text == "🔍 Поиск")
+async def search_start(message: types.Message, state: FSMContext):
+    await message.answer("Введите название, артикул или бренд:")
+    await state.set_state(SearchStates.query)
 
-@dp.message(EditProductStates.specs)
-async def edit_p_final(m: types.Message, state: FSMContext):
-    data = await state.get_data()
-    pid = data['edit_pid']
-    
-    # Получаем старые данные из базы, чтобы сохранить их, если введен "-"
-    old_p = db.get_product_by_id(pid)
-    
-    new_name = data['name'] if data['name'] != "-" else old_p[1]
-    new_price = float(data['price']) if data['price'] != "-" else old_p[2]
-    new_specs = m.text if m.text != "-" else old_p[4]
-    
-    # Вызываем метод обновления в БД
-    db.update_product(pid, new_name, new_price, new_specs)
-    
+
+@dp.message(SearchStates.query)
+async def search_run(message: types.Message, state: FSMContext):
+    items = db.search_products(message.text)
     await state.clear()
-    await m.answer("✅ Товар успешно обновлен!")
+    if not items:
+        return await message.answer("Ничего не найдено.")
+    await message.answer(f"Найдено: {len(items)}")
+    for item in items:
+        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
 
-# --- ИСТОРИЯ ЗАКАЗОВ (ПОЛЬЗОВАТЕЛЬ) ---
 
+# --- ИЗБРАННОЕ ---
+@dp.message(F.text == "⭐ Избранное")
+async def favorites(message: types.Message):
+    items = db.get_favorites(message.from_user.id)
+    if not items:
+        return await message.answer("Избранное пусто.")
+    for item in items:
+        await send_product_card(bot, message.chat.id, item, is_admin(message.from_user))
+
+
+@dp.callback_query(F.data.startswith("fav_"))
+async def toggle_fav(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[1])
+    added = db.toggle_favorite(callback.from_user.id, pid)
+    await callback.answer("В избранном" if added else "Убрано из избранного")
+
+
+# --- КОРЗИНА ---
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[1])
+    ok, err = db.add_to_cart(callback.from_user.id, pid)
+    if not ok:
+        return await callback.answer(err, show_alert=True)
+    await callback.answer("Добавлено")
+    await callback.message.answer(
+        f"✅ В корзине: {db.get_cart_count(callback.from_user.id)}",
+        reply_markup=await menu_for(callback.from_user.id),
+    )
+
+
+@dp.message(F.text.startswith("🛒 Корзина"))
+async def show_cart(message: types.Message):
+    text, *_ = db.format_cart_text(message.from_user.id)
+    if not text:
+        return await message.answer("Корзина пуста.")
+    await message.answer(text, reply_markup=kb.cart_kb(), parse_mode="Markdown")
+    for item in db.get_cart_items(message.from_user.id):
+        await message.answer(
+            f"{item['name']} × {item['qty']}",
+            reply_markup=kb.cart_item_kb(item["product_id"]),
+        )
+
+
+@dp.callback_query(F.data.startswith("cart_plus_"))
+async def cart_plus(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[2])
+    if not db.change_cart_qty(callback.from_user.id, pid, 1):
+        return await callback.answer("Недостаточно на складе", show_alert=True)
+    await callback.answer("+1")
+    await _refresh_cart(callback)
+
+
+@dp.callback_query(F.data.startswith("cart_minus_"))
+async def cart_minus(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[2])
+    db.change_cart_qty(callback.from_user.id, pid, -1)
+    await callback.answer("-1")
+    await _refresh_cart(callback)
+
+
+@dp.callback_query(F.data.startswith("cart_remove_"))
+async def cart_remove(callback: types.CallbackQuery):
+    pid = int(callback.data.split("_")[2])
+    db.remove_from_cart(callback.from_user.id, pid)
+    await callback.answer("Удалено")
+    await _refresh_cart(callback)
+
+
+async def _refresh_cart(callback: types.CallbackQuery):
+    text, *_ = db.format_cart_text(callback.from_user.id)
+    if text:
+        try:
+            await callback.message.edit_text(text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "clear_cart")
+async def clear_cart_handler(callback: types.CallbackQuery):
+    if not db.get_cart_count(callback.from_user.id):
+        return await callback.answer("Корзина пуста", show_alert=True)
+    db.clear_cart(callback.from_user.id)
+    await callback.message.edit_text("🗑 Корзина очищена.")
+    await callback.message.answer(reply_markup=await menu_for(callback.from_user.id))
+    await callback.answer()
+
+
+# --- CHECKOUT ---
+@dp.callback_query(F.data == "checkout_start")
+async def checkout_start(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    if not db.get_cart_count(uid):
+        return await callback.answer("Корзина пуста", show_alert=True)
+    if not db.get_profile(uid):
+        await callback.message.answer("Заполните профиль.")
+        await state.set_state(ProfileStates.name)
+        await callback.message.answer("Введите ФИО (2–4 слова, без цифр):")
+        return await callback.answer()
+    await callback.message.answer("Способ получения:", reply_markup=kb.delivery_kb())
+    await state.set_state(CheckoutStates.delivery_type)
+    await callback.answer()
+
+
+@dp.callback_query(CheckoutStates.delivery_type, F.data.startswith("delivery_"))
+async def checkout_delivery(callback: types.CallbackQuery, state: FSMContext):
+    dtype = "pickup" if callback.data == "delivery_pickup" else "courier"
+    await state.update_data(delivery_type=dtype)
+    await callback.message.answer("Телефон:", reply_markup=kb.phone_request_kb())
+    await state.set_state(CheckoutStates.phone)
+    await callback.answer()
+
+
+@dp.message(CheckoutStates.phone, F.contact)
+async def checkout_phone_contact(message: types.Message, state: FSMContext):
+    ok, phone = normalize_phone(message.contact.phone_number)
+    if not ok:
+        return await message.answer(phone)
+    await state.update_data(phone=phone)
+    await _checkout_after_phone(message, state)
+
+
+@dp.message(CheckoutStates.phone)
+async def checkout_phone_text(message: types.Message, state: FSMContext):
+    ok, phone = normalize_phone(message.text)
+    if not ok:
+        return await message.answer(phone + "\nИли нажмите кнопку отправки контакта.")
+    await state.update_data(phone=phone)
+    await _checkout_after_phone(message, state)
+
+
+async def _checkout_after_phone(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get("delivery_type") == "courier":
+        await message.answer("Адрес доставки:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(CheckoutStates.address)
+    else:
+        await state.update_data(address="Самовывоз")
+        await _show_order_preview(message, state)
+
+
+@dp.message(CheckoutStates.address)
+async def checkout_address(message: types.Message, state: FSMContext):
+    await state.update_data(address=message.text)
+    await _show_order_preview(message, state)
+
+
+async def _show_order_preview(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    text, subtotal, discount, total, _ = db.format_cart_text(uid)
+    data = await state.get_data()
+    label = "🏪 Самовывоз" if data["delivery_type"] == "pickup" else "🚚 Доставка"
+    preview = (
+        f"{text}\n\n**Способ:** {label}\n**Телефон:** {data['phone']}\n"
+        f"**Адрес:** {data.get('address', '—')}\n\nПодтвердите:"
+    )
+    await state.update_data(subtotal=subtotal, discount=discount, total=total)
+    await message.answer(preview, reply_markup=kb.confirm_order_kb(), parse_mode="Markdown")
+    await state.set_state(CheckoutStates.confirm)
+
+
+@dp.callback_query(CheckoutStates.confirm, F.data == "checkout_confirm")
+async def checkout_confirm(callback: types.CallbackQuery, state: FSMContext):
+    uid = callback.from_user.id
+    data = await state.get_data()
+    items = db.get_cart_items(uid)
+    if not items:
+        await state.clear()
+        return await callback.answer("Корзина пуста", show_alert=True)
+    items_text = ", ".join(f"{i['name']} × {i['qty']}" for i in items)
+    total = data["total"]
+    order_id = db.add_order(
+        uid, items_text, total, data["delivery_type"],
+        data["phone"], data.get("address", ""), data.get("discount", 0),
+    )
+    for i in items:
+        db.decrease_stock(i["product_id"], i["qty"])
+    db.clear_cart(uid)
+    profile = db.get_profile(uid)
+    client = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {uid}"
+    if profile:
+        client += f"\n👤 {profile[0]} | 📞 {profile[1]}"
+    label = "Самовывоз" if data["delivery_type"] == "pickup" else "Доставка"
+    await callback.message.edit_text(
+        f"✅ **Заказ №{order_id} принят!**\n{items_text}\n💰 {int(total):,} ₽",
+        parse_mode="Markdown",
+    )
+    await callback.message.answer("Спасибо!", reply_markup=await menu_for(uid))
+    await bot.send_message(
+        ADMIN_ID,
+        f"🔔 **ЗАКАЗ №{order_id}**\n{client}\n🛒 {items_text}\n💰 {int(total):,} ₽\n📞 {data['phone']}\n📍 {data.get('address')}\n{label}",
+        parse_mode="Markdown",
+        reply_markup=kb.admin_order_manage_kb(order_id),
+    )
+    logger.info("Order #%s from user %s total %s", order_id, uid, total)
+    await state.clear()
+    await callback.answer()
+
+
+@dp.callback_query(CheckoutStates.confirm, F.data == "checkout_cancel")
+async def checkout_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Оформление отменено.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "repeat_order")
+async def repeat_order(callback: types.CallbackQuery):
+    order = db.get_last_completed_order(callback.from_user.id)
+    if not order:
+        return await callback.answer("Нет завершённых заказов", show_alert=True)
+    await callback.message.answer(f"Последний заказ №{order['id']}:\n{order['items_text']}")
+    await callback.answer()
+
+
+# --- ПРОФИЛЬ ---
+@dp.message(F.text == "👤 Профиль")
+async def profile(message: types.Message):
+    p = db.get_profile(message.from_user.id)
+    text = f"👤 **Профиль**\n\nФИО: {p[0]}\nТел: {p[1]}\nГород: {p[2]}" if p else "Профиль не заполнен."
+    await message.answer(text, reply_markup=kb.user_profile_kb(), parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "edit_profile")
+async def profile_edit(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "Введите ФИО (минимум 2 слова, без цифр):",
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
+    await state.set_state(ProfileStates.name)
+    await callback.answer()
+
+
+@dp.message(ProfileStates.name)
+async def p_name(message: types.Message, state: FSMContext):
+    ok, result = validate_fio(message.text)
+    if not ok:
+        return await message.answer(result)
+    await state.update_data(name=result)
+    await message.answer("Телефон (+7...) или кнопка ниже:", reply_markup=kb.phone_request_kb())
+    await state.set_state(ProfileStates.phone)
+
+
+@dp.message(ProfileStates.phone, F.contact)
+async def p_phone_contact(message: types.Message, state: FSMContext):
+    ok, phone = normalize_phone(message.contact.phone_number)
+    if not ok:
+        return await message.answer(phone)
+    await state.update_data(phone=phone)
+    await message.answer("Город:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(ProfileStates.city)
+
+
+@dp.message(ProfileStates.phone)
+async def p_phone(message: types.Message, state: FSMContext):
+    ok, phone = normalize_phone(message.text)
+    if not ok:
+        return await message.answer(phone)
+    await state.update_data(phone=phone)
+    await message.answer("Город:")
+    await state.set_state(ProfileStates.city)
+
+
+@dp.message(ProfileStates.city)
+async def p_city(message: types.Message, state: FSMContext):
+    ok, city = validate_city(message.text)
+    if not ok:
+        return await message.answer(city)
+    data = await state.get_data()
+    uid = message.from_user.id
+    db.save_profile(uid, data["name"], data["phone"], city)
+    await state.clear()
+    logger.info("Profile saved for user %s", uid)
+    await message.answer("✅ Профиль сохранён!", reply_markup=await menu_for(uid))
+
+
+# --- КОНСУЛЬТАЦИЯ ---
+@dp.message(F.text == "💬 Консультация")
+async def consultation(message: types.Message):
+    if not db.get_faq_items():
+        return await message.answer(
+            "Раздел в настройке. Свяжитесь с менеджером:",
+            reply_markup=kb.manager_kb(),
+        )
+    await message.answer(
+        "Частые вопросы по сантехнике:",
+        reply_markup=kb.get_consultation_kb(),
+    )
+
+
+@dp.callback_query(F.data.regexp(r"^faq_\d+$"))
+async def faq_answer(callback: types.CallbackQuery):
+    faq_id = int(callback.data.split("_")[1])
+    item = db.get_faq_by_id(faq_id)
+    if not item or not item["is_active"]:
+        return await callback.answer("Тема недоступна", show_alert=True)
+    await callback.message.answer(item["content"], parse_mode="Markdown")
+    await callback.answer()
+
+
+@dp.message(F.text == "👨‍💻 Менеджер")
+async def manager(message: types.Message):
+    await message.answer("Связь с менеджером:", reply_markup=kb.manager_kb())
+
+
+# --- ЗАКАЗЫ ---
 @dp.callback_query(F.data == "my_orders_menu")
 async def my_orders_menu(callback: types.CallbackQuery):
-    await callback.message.answer("Выберите категорию заказов:", reply_markup=kb.user_orders_type_kb)
+    await callback.message.answer("Категория:", reply_markup=kb.user_orders_type_kb())
     await callback.answer()
+
 
 @dp.callback_query(F.data.startswith("u_history_"))
 async def show_user_history(callback: types.CallbackQuery):
-    # Извлекаем ключ (processing, done или cancel)
-    status_key = callback.data.split("_")[2]
-    
-    # Тот самый словарь-переводчик
-    status_map = {
-        "processing": "В обработке", 
-        "done": "completed", 
-        "cancel": "cancelled"
-    }
-    
-    target_status = status_map.get(status_key)
-    orders = db.get_user_orders(callback.from_user.id, target_status)
-    
+    key = callback.data.split("_")[2]
+    smap = {"processing": STATUS_PROCESSING, "done": STATUS_COMPLETED, "cancel": STATUS_CANCELLED}
+    orders = db.get_user_orders(callback.from_user.id, smap[key])
     if not orders:
-        return await callback.answer("Заказов не найдено", show_alert=True)
-
-    await callback.message.answer(f"📜 **История ваших заказов ({target_status}):**", parse_mode="Markdown")
+        return await callback.answer("Нет заказов", show_alert=True)
     for o in orders:
-        # o[0] - ID, o[1] - товары, o[2] - сумма
-        await callback.message.answer(f"🆔 Заказ **#{o[0]}**\n🛒 {o[1]}\n💰 {int(o[2]):,} р.", parse_mode="Markdown")
+        await callback.message.answer(
+            f"🆔 #{o['id']}\n🛒 {o['items_text']}\n💰 {int(o['total']):,} ₽",
+            parse_mode="Markdown",
+        )
     await callback.answer()
 
-# --- ДОБАВЛЕНИЕ ТОВАРА (АДМИН) ---
-@dp.callback_query(F.data == "admin_add_product")
-async def add_p_start(callback: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user): return
-    await callback.message.answer("Название товара:")
-    await state.set_state(AddProductStates.name)
-    await callback.answer()
 
-@dp.message(AddProductStates.name)
-async def add_p_name(m: types.Message, state: FSMContext):
-    await state.update_data(name=m.text); await m.answer("Цена (число):"); await state.set_state(AddProductStates.price)
-
-@dp.message(AddProductStates.price)
-async def add_p_price(m: types.Message, state: FSMContext):
-    if not m.text.isdigit(): return await m.answer("Введите число!")
-    await state.update_data(price=float(m.text)); await m.answer("Категория:"); await state.set_state(AddProductStates.category)
-
-@dp.message(AddProductStates.category)
-async def add_p_cat(m: types.Message, state: FSMContext):
-    await state.update_data(category=m.text.lower()); await m.answer("Описание:"); await state.set_state(AddProductStates.specs)
-
-@dp.message(AddProductStates.specs)
-async def add_p_final(m: types.Message, state: FSMContext):
-    d = await state.get_data()
-    db.add_product(d['name'], d['price'], d['category'], m.text)
-    await state.clear()
-    await m.answer("✅ Товар добавлен!", reply_markup=kb.get_main_menu('admin'))
-
-# --- КОРЗИНА И ЗАКАЗ ---
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy(callback: types.CallbackQuery):
-    uid = callback.from_user.id
-    user_carts.setdefault(uid, []).append(int(callback.data.split("_")[1]))
-    await callback.message.answer(f"✅ Добавлено! В корзине: {len(user_carts[uid])}", reply_markup=kb.get_main_menu(db.get_role(uid), len(user_carts[uid])))
-    await callback.answer()
-
-@dp.message(F.text.startswith("🛒 Корзина"))
-async def cart(m: types.Message):
-    items = user_carts.get(m.from_user.id, [])
-    if not items: return await m.answer("Пусто")
-    total = 0
-    res = "📦 **Ваша корзина:**\n\n"
-    for pid in items:
-        p = db.get_product_by_id(pid)
-        res += f"• {p[1]} — {int(p[2]):,} р.\n"
-        total += p[2]
-    await m.answer(f"{res}\nИТОГО: {int(total):,} р.", reply_markup=kb.cart_kb(), parse_mode="Markdown")
-
-@dp.callback_query(F.data == "checkout")
-async def checkout(callback: types.CallbackQuery):
-    uid = callback.from_user.id
-    items = user_carts.get(uid, [])
-    if not items: 
-        return await callback.answer("Ваша корзина пуста!")
-        
-    p_info = db.get_profile(uid)
-    client = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {uid}"
-    if p_info: 
-        client += f"\n👤 {p_info[0]} | 📞 {p_info[1]}"
-    
-    # Формируем данные заказа
-    txt = ", ".join([db.get_product_by_id(pid)[1] for pid in items])
-    total = sum(db.get_product_by_id(pid)[2] for pid in items)
-    
-    # Сохраняем в БД
-    db.add_order(uid, txt, total)
-    
-    # ОЧИЩАЕМ КОРЗИНУ
-    user_carts[uid] = []
-    
-    # Удаляем инлайн-кнопки из текущего сообщения
-    await callback.message.edit_text(f"✅ **Заказ оформлен!**\nСостав: {txt}\nСумма: {int(total):,} р.", parse_mode="Markdown")
-    
-    # ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ С ОБНОВЛЕННОЙ КЛАВИАТУРОЙ (где Корзина будет (0))
-    role = db.get_role(uid)
-    await callback.message.answer(
-        "Менеджер скоро свяжется с вами. Корзина очищена.", 
-        reply_markup=kb.get_main_menu(role, 0)
-    )
-    
-    # Уведомляем админа
-    await bot.send_message(ADMIN_ID, f"🔔 **НОВЫЙ ЗАКАЗ**\n{client}\n🛒 {txt}\n💰 {int(total):,} р.")
-    await callback.answer()
-    
-@dp.callback_query(F.data == "clear_cart")
-async def clear_cart_handler(callback: types.CallbackQuery):
-    uid = callback.from_user.id
-    
-    # Проверяем, есть ли что-то в корзине
-    if uid not in user_carts or not user_carts[uid]:
-        return await callback.answer("Корзина и так пуста!", show_alert=True)
-    
-    # 1. Очищаем список в памяти
-    user_carts[uid] = []
-    
-    # 2. Обновляем текущее сообщение (убираем список товаров)
-    await callback.message.edit_text("🗑 **Корзина очищена.**", parse_mode="Markdown")
-    
-    # 3. Отправляем новое сообщение, чтобы обновить Reply-кнопки (убрать цифру с кнопки)
-    role = db.get_role(uid)
-    await callback.message.answer(
-        "Вы можете выбрать новые товары в каталоге.",
-        reply_markup=kb.get_main_menu(role, 0) # Явно передаем 0
-    )
-    
-    await callback.answer("Корзина очищена")
-
-# --- ПРОФИЛЬ И ДЕШБОРД ---
-@dp.message(F.text == "👤 Профиль")
-async def profile(m: types.Message):
-    p = db.get_profile(m.from_user.id)
-    text = f"👤 **Профиль**\n\nФИО: {p[0]}\nТел: {p[1]}\nГород: {p[2]}" if p else "⚙️ Профиль не заполнен."
-    await m.answer(text, reply_markup=kb.user_profile_kb, parse_mode="Markdown")
-
+# --- ДЕШБОРД ---
 @dp.message(F.text == "📊 Дешборд")
-async def dashboard(m: types.Message):
-    if not is_admin(m.from_user): return
-    orders = db.get_orders_by_status("В обработке")
-    await m.answer(f"📈 **ДЕШБОРД**\nВыручка: {int(db.get_total_sales()):,} р.", reply_markup=kb.admin_dashboard_kb)
-    for o in orders:
-        await m.answer(f"🆔 #{o[0]} | 💰 {int(o[3]):,} р.\n🛒 {o[2]}", reply_markup=kb.admin_order_manage_kb(o[0]))
+async def dashboard(message: types.Message):
+    if not is_admin(message.from_user):
+        return
+    await message.answer(format_dashboard_text(), reply_markup=kb.admin_dashboard_kb, parse_mode="Markdown")
+    for o in db.get_orders_by_status(STATUS_PROCESSING):
+        await message.answer(
+            f"🆔 #{o['id']} | 💰 {int(o['total']):,} ₽\n🛒 {o['items_text']}",
+            reply_markup=kb.admin_order_manage_kb(o["id"]),
+        )
+
 
 @dp.callback_query(F.data.startswith("status_"))
 async def status_upd(callback: types.CallbackQuery):
-    _, action, oid = callback.data.split("_")
-    
-    # 1. Получаем данные заказа, чтобы узнать ID пользователя (uid)
-    # Предположим, db.get_order_by_id возвращает (id, user_id, items, total, status)
-    order_data = db.get_order_by_id(int(oid))
-    customer_id = order_data[1] 
-    
-    tech_status = "completed" if action == "done" else "cancelled"
-    display_status = "✅ Завершен" if action == "done" else "❌ Отменен"
-    
-    # 2. Обновляем в базе
-    db.update_order_status(int(oid), tech_status)
-    
-    # 3. УВЕДОМЛЯЕМ ПОЛЬЗОВАТЕЛЯ
+    if not is_admin(callback.from_user):
+        return await callback.answer("Нет доступа", show_alert=True)
+    parts = callback.data.split("_")
+    action, oid = parts[1], int(parts[2])
+    order = db.get_order_by_id(oid)
+    if not order:
+        return await callback.answer("Не найден", show_alert=True)
+    tech = STATUS_COMPLETED if action == "done" else STATUS_CANCELLED
+    db.update_order_status(oid, tech)
     try:
-        status_msg = (
-            f"🔔 **Обновление по вашему заказу #{oid}**\n"
-            f"Статус изменен на: **{display_status}**"
+        await bot.send_message(
+            order["user_id"],
+            f"🔔 Заказ №{oid}: **{STATUS_LABELS[tech]}**",
+            parse_mode="Markdown",
         )
-        await bot.send_message(customer_id, status_msg, parse_mode="Markdown")
     except Exception as e:
-        logging.error(f"Не удалось отправить уведомление пользователю {customer_id}: {e}")
-
-    # 4. Обновляем дешборд админа (твой текущий код)
-    current_sales = db.get_total_sales()
+        logger.error("Notify %s: %s", order["user_id"], e)
     await callback.message.edit_text(
-        f"{callback.message.text}\n\n"
-        f"Статус: {display_status}\n"
-        f"📊 Актуальная выручка: {int(current_sales):,} р."
+        f"{callback.message.text}\n\n{STATUS_LABELS[tech]}\n📊 {int(db.get_total_sales()):,} ₽"
     )
-    await callback.answer(f"Статус изменен")
+    logger.info("Order #%s -> %s by admin", oid, tech)
+    await callback.answer()
 
-@dp.message(F.text == "👨‍💻 Менеджер")
-async def manager(m: types.Message):
-    await m.answer("Связь с менеджером:", reply_markup=kb.manager_kb)
 
-# --- АНКЕТА (FSM) ---
-@dp.callback_query(F.data == "edit_profile")
-async def profile_edit(c: types.CallbackQuery, state: FSMContext):
-    await c.message.answer("Введите ФИО:"); await state.set_state(ProfileStates.name); await c.answer()
+@dp.callback_query(F.data == "admin_history_done")
+async def admin_history_done(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user):
+        return
+    orders = db.get_orders_by_status(STATUS_COMPLETED)[:15]
+    if not orders:
+        return await callback.answer("Пусто", show_alert=True)
+    text = "✅ **Завершённые:**\n\n" + "\n".join(
+        f"#{o['id']} | {int(o['total']):,} ₽" for o in orders
+    )
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
 
-@dp.message(ProfileStates.name)
-async def p_name(m: types.Message, state: FSMContext):
-    await state.update_data(name=m.text); await m.answer("Телефон:"); await state.set_state(ProfileStates.phone)
 
-@dp.message(ProfileStates.phone)
-async def p_phone(m: types.Message, state: FSMContext):
-    await state.update_data(phone=m.text); await m.answer("Город:"); await state.set_state(ProfileStates.city)
+@dp.callback_query(F.data == "admin_history_cancel")
+async def admin_history_cancel(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user):
+        return
+    orders = db.get_orders_by_status(STATUS_CANCELLED)[:15]
+    if not orders:
+        return await callback.answer("Пусто", show_alert=True)
+    text = "❌ **Отменённые:**\n\n" + "\n".join(f"#{o['id']}" for o in orders)
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
 
-@dp.message(ProfileStates.city)
-async def p_city(m: types.Message, state: FSMContext):
-    d = await state.get_data(); db.save_profile(m.from_user.id, d['name'], d['phone'], m.text); await state.clear()
-    await m.answer("✅ Сохранено!", reply_markup=kb.get_main_menu(db.get_role(m.from_user.id)))
+
+# --- УДАЛЕНИЕ ТОВАРА ---
+@dp.callback_query(F.data.startswith("del_prod_"))
+async def del_prod_ask(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user):
+        return
+    pid = int(callback.data.split("_")[2])
+    await callback.message.answer("Удалить?", reply_markup=kb.delete_confirm_kb(pid))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("del_confirm_"))
+async def del_prod_confirm(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user):
+        return
+    pid = int(callback.data.split("_")[2])
+    db.delete_product(pid)
+    logger.info("Product #%s deleted", pid)
+    await callback.message.edit_text("🗑 Удалён.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "del_cancel")
+async def del_prod_cancel(callback: types.CallbackQuery):
+    await callback.message.edit_text("Отменено.")
+    await callback.answer()
+
+
+@dp.message(StateFilter(None))
+async def unknown_message(message: types.Message):
+    await message.answer("Используйте меню 👇", reply_markup=await menu_for(message.from_user.id))
+
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Укажите BOT_TOKEN в .env")
+    if db.faq_count() == 0:
+        from seed_faq import FAQ_DATA
+        for i, (title, content) in enumerate(FAQ_DATA):
+            db.add_faq(title, content, sort_order=i)
+        logger.info("FAQ seeded: %s topics", len(FAQ_DATA))
+    logger.info("Bot starting...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

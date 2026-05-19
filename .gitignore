@@ -1,0 +1,9 @@
+.env
+logs/
+__pycache__/
+handlers/__pycache__/
+utils/__pycache__/
+middleware/__pycache__/
+*.pyc
+_vkr_extract.txt
+.shop.db-journal
